@@ -1,0 +1,766 @@
+---
+title: "Tech 3. Analyses"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = F, echo = T)
+
+#rm(list = ls()) # clean workspace
+
+pacman::p_load("tidyverse","ragg","countrycode","ggplot2",
+               "ggrepel","jtools","sjPlot", "sjmisc", "lme4",
+               "ggeffects", "ggpubr", "kableExtra", "ggstance", "here")
+
+```
+
+```{r load}
+df_raw <- readRDS(here::here("data/df_imp_raw.Rds"))
+
+# some cleaning, WHO variables, plus total suicide rate from OWD
+df_raw <- df_raw %>%
+  mutate(suicide_total_owd = suicide_rate_total_owd*10,
+         suicide_rate_female_owd = suicide_rate_female_owd*10,
+         suicide_rate_male_owd = suicide_rate_male_owd*10) %>%
+  filter(suicide_rate_male_owd != "NaN")
+
+
+
+
+```
+
+
+### Cross-Sectional
+
+Suicides in Greenland are tremandous in comparison to all other countries. it is a massive outlier. Moreover, fertility has declined and suicides have declined which generates a positive correlation between the two and has such a powerful effect on the regressions that the coefficient appears positive with Greenland in, and negative with Greenland out. For this reason it should not be included.
+
+
+```{r cross_setup, warning = F}
+# Take the average of countries after 2009 for comparison
+
+df_cross <- df_raw %>%
+  filter(!is.na(suicide_rate_male_owd) & iso3c != "GRL") %>%
+  group_by(iso3c) %>%
+  mutate(suicide_total_pcm = suicide_total_owd,
+         suicide_male_pcm = suicide_rate_male_owd,
+         suicide_female_pcm = suicide_rate_female_owd) %>%
+  filter(year > 2009) %>%
+  summarise_all(mean, na.rm = T) %>%
+  mutate(country = countrycode(iso3c, "iso3c", "country.name"),
+         region = countrycode(iso3c, "iso3c", "region"),
+         year = round(year))
+
+# There's a problem with the unemployment interpolation, use this for now
+df_cross <- df_cross %>%
+  mutate(unemp_i = ifelse(is.na(unemp_i), unemp_ilo, unemp_i),
+         unemp_i = ifelse(iso3c == "TWN", 4, ifelse(iso3c == "DMA", 13, ifelse(iso3c == "ATG", 11, ifelse(iso3c == "AND", 2, unemp_i)))), # quick interpolation of employment thx to Google
+         regime_i = ifelse(iso3c %in% c("ISL","AND","MLT"), 9, ifelse(iso3c %in% c("ASM", "ATG", "BHS", "BMU", "GRD", "GRL", "GUM", "LCA", "MDV", "MHL", "PRI", "STP", "SYC", "VCT", "WSM", "BRB"), 7, ifelse(iso3c %in% c("TWN", "TON", "KIR", "ERI", "BRN", "BLZ", "DMA"), 5.5, regime_i))), # regime can be improved from Freedom house and other data, use these guesses for now
+         any_crisis = ifelse(crisis_idx_i > 0.2 | atwar > 0.2 | unemp_i > 11, 1, 0)) # External shock variable, we combine war, high unemployment and economic crisis into a scale of regular/high crisis rates during this period 'crisis'
+
+
+# make a dataset with complete cases for analysis with gini stochastically imputed for now
+df_complete <- as.data.frame(df_cross)
+
+
+df_complete <- df_complete %>%
+  dplyr::select(iso3c, suicide_total_pcm, suicide_female_pcm, suicide_male_pcm, alc_all_types_i, fertility_i, pop65, atwar_i, crisis_idx_i, gini_disp_i, gdp_madki_i, unemp_i, christpct_i, islampct_i, nonreligpct_i, buddhapct_i, hindupct_i, otherpct_i, jewishpct_i, regime_i, socx)
+
+# this should be done by introducing measurement error, but this is quick and dirty for now
+gini_imp <- lm(gini_disp_i ~ suicide_female_pcm + suicide_male_pcm + unemp_i + alc_all_types_i + fertility_i + pop65 + atwar_i + crisis_idx_i + gdp_madki_i + unemp_i + christpct_i + islampct_i + nonreligpct_i + regime_i, data = df_complete)
+
+df_complete$gini_imp_i <- predict(gini_imp, newdata = df_complete)
+
+df_complete <- df_complete %>%
+  mutate(gini_imp_i = ifelse(is.na(gini_disp_i), gini_imp_i, gini_disp_i),
+         christpct_i = christpct_i*100, #easier to interpret as pct points
+         islampct_i = islampct_i*100,
+         nonreligpct_i = nonreligpct_i*100,
+         otherpct_i = otherpct_i*100,
+         jewishpct_i = jewishpct_i*100,
+         hindupct_i = hindupct_i*100,
+         buddhapct_i = buddhapct_i*100,
+         crisis_idx_i = crisis_idx_i*100,
+         atwar_i = atwar_i*100,
+         gdp_madki_i = ifelse(gdp_madki_i > 75, 75, gdp_madki_i),
+         gdp_log_i = log(gdp_madki_i)) %>% 
+  dplyr::select(-c(gini_disp_i)) %>%
+  filter(complete.cases(.))
+
+# partial fertility from GDP
+fert_rel <- lm(fertility_i ~ gdp_madki_i, data = df_complete)
+df_complete$fertility_partial_i <- df_complete$fertility_i - predict(fert_rel, newdata = df_complete)
+
+# add non-zeros for logging
+df_complete <- df_complete  %>% 
+  mutate(nonreligpct_i = ifelse(nonreligpct_i == 0, 0.001, nonreligpct_i))
+
+  
+```
+
+
+
+
+```{r cross_fig_alc}
+
+# Total
+g1 <- ggplot(df_cross, aes(x = alc_all_types_i, y = suicide_total_pcm)) +
+  geom_point(color = "white") +
+  geom_smooth(method = "lm") +
+  geom_text_repel(label = df_cross$iso3c, size = 2) +
+  xlab("Alcohol Consumption in Liters Per Capita-Year") +
+  ylab("Suicides Per Million Capita") +
+  ggtitle("TOTAL") +
+  ylim(0,350) +
+  theme_classic() +
+  theme(plot.title = element_text(face = 2, hjust = -0.06, vjust = 0.5))
+
+# Males
+g2 <- ggplot(df_cross, aes(x = alc_all_types_i, y = suicide_male_pcm)) +
+  geom_point(color = "white") +
+  geom_smooth(method = "lm") +
+  geom_text_repel(label = df_cross$iso3c, size = 2) +
+  xlab("Alcohol Consumption in Liters Per Capita-Year") +
+  ylab("") +
+  ggtitle("MALES") +
+  ylim(0,350) +
+  theme_classic() +
+  theme(plot.title = element_text(face = 2, hjust = -0.06, vjust = 0.5))
+
+# Females
+g3 <- ggplot(df_cross, aes(x = alc_all_types_i, y = suicide_female_pcm)) +
+  geom_point(color = "white") +
+  geom_smooth(method = "lm") +
+  geom_text_repel(label = df_cross$iso3c, size = 2) +
+  xlab("Alcohol Consumption in Liters Per Capita-Year") +
+  ylab("") +
+  ggtitle("FEMALES") +
+  ylim(0,350) +
+  theme_classic() +
+  theme(plot.title = element_text(face = 2, hjust = -0.06, vjust = 0.5))
+  
+
+# Relative fertility
+
+
+
+```
+
+
+```{r alc_combined}
+
+agg_png(filename = here::here("results/Fig1.png"), res = 144, width = 2200, height = 800)
+ggarrange(g1,g2,g3, ncol = 3, nrow= 1) 
+
+dev.off()
+
+knitr::include_graphics(here::here("results/Fig1.png"))
+```
+
+### Male to Female Association
+
+```{r m2f}
+ggplot(df_cross, aes(x = suicide_male_pcm, y = suicide_female_pcm)) +
+  geom_point(color = "red") +
+  geom_text_repel(label = df_cross$iso3c, size = 2) +
+  geom_smooth(method = "lm") +
+  
+  xlab("Male Suicides per Capita Mil.") +
+  ylab("Female Suicides per Capita Mil.") +
+  xlim(0,600) +
+  ylim(0,180) +
+  theme_classic() +
+  theme(plot.title = element_text(face = 2, hjust = -0.06, vjust = 0.5))
+```
+### Fertility and Suicide
+
+```{r cross_fig_fert}
+ggplot(df_cross, aes(x = fertility, y = suicide_total_owd)) +
+  geom_point(color = "white") +
+  geom_smooth(method = "lm") +
+  ggpubr::stat_cor() +
+  geom_text_repel(label = df_cross$iso3c, size = 3) +
+  xlab("Fertility Rate") +
+  ylab("Suicides Per Million Capita") +
+
+  theme_classic()
+```
+
+### Fertility and Alcohol
+
+```{r cross_fig_fertalc}
+ggplot(df_cross, aes(x = fertility, y = alc_all_types_i)) +
+  geom_point(color = "white") +
+  geom_smooth(method = "lm") +
+  ggpubr::stat_cor() +
+  geom_text_repel(label = df_cross$iso3c, size = 3) +
+  xlab("Fertility Rate") +
+  ylab("alcohol Consumption") +
+
+  theme_classic()
+```
+### GDP and Suicide
+
+```{r cross_fig_gdp}
+
+agg_png(filename = here::here("results/Fig5.png"), res = 144, width = 2000, height = 1600)
+ggplot(df_cross, aes(x = gdp_madki, y = suicide_total_owd)) +
+  geom_point(color = "white") +
+  geom_smooth(method = "lm") +
+  ggpubr::stat_cor() +
+  geom_text_repel(label = df_cross$iso3c, size = 3, aes(color = df_cross$region)) +
+  xlab("GDP Per Capita in Thousands of 2010$US") +
+  ylab("Suicides Per Million Capita") +
+  xlim(0,100) +
+  ylim(0,400) +
+  theme_classic()
+dev.off()
+
+knitr::include_graphics(here::here("results/Fig5.png"))
+  
+  
+
+
+```
+
+```{r cross_fig_nonrelig}
+
+agg_png(filename = here::here("results/Fig6.png"), res = 144, width = 2000, height = 1600)
+ggplot(df_cross, aes(x = nonreligpct_i, y = suicide_total_owd)) +
+  geom_point(color = "red") +
+  geom_smooth(method = "lm") +
+  ggpubr::stat_cor() +
+  geom_text_repel(label = df_cross$iso3c, size = 3, aes(color = df_cross$region)) +
+  xlab("Percent of Population Non-Religious") +
+  ylab("Suicides Per Million Capita") +
+  #xlim(0,100) +
+  ylim(0,400) +
+  theme_classic()
+dev.off()
+
+knitr::include_graphics(here::here("results/Fig6.png"))
+  
+  
+
+
+```
+
+### Cross-Sectional Correlations
+```{r corr_mtrx}
+cor <- df_complete %>%
+  cor(use = "pairwise.complete.obs") %>%
+  round(.,3)
+
+cor[upper.tri(cor, diag = T)] <- ""
+
+kable_styling(kable(cor))
+```
+
+### Cross-Sectional Regresssions
+
+As alcohol consumption and population over 65 are correlated at 0.715 they cannot be in the same regressions.
+
+170 complete/interpolated cases
+
+
+#### Models
+
+```{r cross_reg}
+# subset for equal samples
+
+# straight-forward cross-sectional factors
+m01 <- lm(log(suicide_total_pcm) ~ alc_all_types_i + gdp_madki_i, data = df_complete)
+  ## alternative economic measure
+  m01_unemp <- lm(suicide_total_pcm ~ alc_all_types_i + fertility_i + unemp_i, data = df_complete)
+  ## log GDP
+  m01_gdpl <- lm(suicide_total_pcm ~ alc_all_types_i + fertility_i + gdp_log_i, data = df_complete)
+  ## alternative demographic measure
+  m02_pop65 <- lm(suicide_total_pcm ~ alc_all_types_i + pop65 + gdp_madki_i, data = df_complete) 
+
+# demographics - fertility, not clear what it measures though
+
+m02 <- lm(log(suicide_total_pcm) ~ alc_all_types_i + fertility_partial_i + gdp_madki_i, data = df_complete)
+m02m <- lm(log(suicide_male_pcm) ~ alc_all_types_i + fertility_partial_i + gdp_madki_i, data = df_complete)
+m02f <- lm(log(suicide_female_pcm) ~ alc_all_types_i + fertility_partial_i + gdp_madki_i, data = df_complete)
+
+m01_pop65 <- lm(log(suicide_total_pcm) ~ alc_all_types_i + pop65 + gdp_madki_i, data = df_complete)
+
+m01_fert <- lm(log(suicide_total_pcm) ~ alc_all_types_i + fertility_i + gdp_madki_i, data = df_complete)
+
+# deprivation/inequality
+m03 <- lm(log(suicide_total_pcm) ~ alc_all_types_i + fertility_partial_i + gdp_madki_i + gini_imp_i, data = df_complete)
+
+# religion (reference group is percent Islam)
+m04 <- lm(log(suicide_total_pcm) ~ alc_all_types_i + fertility_partial_i + gdp_madki_i + christpct_i +  buddhapct_i  + hindupct_i + jewishpct_i + otherpct_i + nonreligpct_i, data = df_complete)
+m04m <- lm(log(suicide_male_pcm) ~ alc_all_types_i + fertility_partial_i + gdp_madki_i + christpct_i +  buddhapct_i  + hindupct_i + jewishpct_i + otherpct_i + nonreligpct_i, data = df_complete)
+m04f <- lm(log(suicide_female_pcm) ~ alc_all_types_i + fertility_partial_i + gdp_madki_i + christpct_i +  buddhapct_i  + hindupct_i + jewishpct_i + otherpct_i + nonreligpct_i, data = df_complete)
+
+# economic crisis and war
+m05 <- lm(log(suicide_total_pcm) ~ alc_all_types_i + fertility_partial_i + gdp_madki_i + crisis_idx_i + atwar_i, data = df_complete)
+
+# degree of democracy
+m06 <- lm(log(suicide_total_pcm) ~ alc_all_types_i + fertility_partial_i + gdp_madki_i + regime_i, data = df_complete)
+
+# for plotting
+m07 <- lm(log(suicide_total_pcm) ~ alc_all_types_i + fertility_partial_i + gdp_madki_i + gini_imp_i + crisis_idx_i + atwar_i + regime_i, data = df_complete)
+m07m <- lm(log(suicide_male_pcm) ~ alc_all_types_i + fertility_partial_i + gdp_madki_i + gini_imp_i + crisis_idx_i + atwar_i + regime_i, data = df_complete)
+m07f <- lm(log(suicide_female_pcm) ~ alc_all_types_i + fertility_partial_i + gdp_madki_i + gini_imp_i + crisis_idx_i + atwar_i + regime_i, data = df_complete)
+
+# political regime
+```
+
+#### Coefficient Plots
+
+```{r fig2}
+#plot_coefs(m01,m01a,m01b,m01c)
+
+fig21 <- plot_coefs(m02, m07, m04,  colors = "Qual1", 
+           #model.names = c("Major Factors", "Social Structure", "Religion"),
+           coefs = c("Alcohol Consumption\n(L per capita)" = "alc_all_types_i", "Fertility Rate\n(GDP adjusted)" = "fertility_partial_i", "GDP per capita\n(2010 $US k)" = "gdp_madki_i", "Disposable Gini\n(with stoch. imputation)" = "gini_imp_i", "Economic Crisis Scale" = "crisis_idx_i", "At War" = "atwar_i", "Democratization Scale" = "regime_i", "Christian (%)" = "christpct_i", "Buddhist (%)" = "buddhapct_i", "Hindu (%)" = "hindupct_i", "Jewish (%)" = "jewishpct_i", "Other Relig. (%)" = "otherpct_i", "Not-Religious (%)" = "nonreligpct_i")
+           ) +
+  coord_cartesian(xlim = c(-0.03,0.22)) +
+  ggtitle("TOTAL") +
+  theme(legend.position = "none",
+        plot.title = element_text(color = "black"),
+        axis.text.y = element_text(color = "black", hjust = 0),
+        axis.title.x = element_text(color = "white"),
+        axis.title.y = element_blank(),
+        #legend.text = element_text(color = "black", size = 14),
+        legend.title = element_blank()
+  )
+
+fig22 <- plot_coefs(m02m, m07m, m04m,  colors = "Qual1"
+           ) +
+  xlab(label = "Coefficient and 95% CI") +
+  coord_cartesian(xlim = c(-0.03,0.22)) +
+  ggtitle("MALES") +
+  annotate(geom = "text", label = "All religious effects\nare relative to\nMuslim (%)", x = 0.04, y = 4, color = "aquamarine4", hjust = 0) +
+  theme(legend.position = "none",
+        plot.title = element_text(color = "black"),
+        axis.text.y = element_blank(),
+        axis.title = element_text(color = "black"),
+        #legend.text = element_text(color = "black", size = 14),
+        legend.title = element_blank()
+  )
+
+fig23 <- plot_coefs(m02f, m07f, m04f,  colors = "Qual1", 
+           model.names = c("Major\nFactors", "Social\nStructure", "Religion")
+           ) +
+  #xlab(label = "Coefficient and 95% CI") +
+  coord_cartesian(xlim = c(-0.03,0.22)) +
+  ggtitle("FEMALES") +
+  theme(legend.position = "none",
+        plot.title = element_text(color = "black"),
+        axis.text.y = element_blank(),
+        axis.title.x = element_text(color = "white"),
+        legend.text = element_text(color = "black", size = 13),
+        legend.title = element_blank()
+  )
+        
+        
+agg_png(filename = here::here("results/Fig3.png"), height = 900, width = 1400, res = 144)
+
+ggarrange(fig21, fig22, fig23, widths = c(3,2,2), nrow = 1, ncol = 3) 
+                                  
+
+
+dev.off()
+
+knitr::include_graphics(here::here("results/Fig3.png"))
+
+```
+
+
+#### Regression Tables
+
+##### Total
+
+```{r tabmodel}
+tab_model(m02, m07, m04, digits = 3, p.style = "stars", show.ci = F, show.loglik = T, show.aic = T, file = here::here("results/TabA1.htm"))
+
+htmltools::includeHTML(here::here("results/TabA1.htm"))
+```
+
+
+##### Females
+
+```{r tabmodel}
+tab_model(m02f, m07f, m04f, digits = 3, p.style = "stars", show.ci = F, show.loglik = T, show.aic = T, file = here::here("results/TabA2.htm"))
+
+htmltools::includeHTML(here::here("results/TabA2.htm"))
+```
+
+
+##### Males
+
+```{r tabmodel}
+tab_model(m02m, m07m, m04m, digits = 3, p.style = "stars", show.ci = F, show.loglik = T, show.aic = T, file = here::here("results/TabA3.htm"))
+
+htmltools::includeHTML(here::here("results/TabA3.htm"))
+```
+
+### Within-Country Effects
+
+We elect to mean-center our variables within countries. Although GLM estimation routines account for this when country is specified as a level, the results presented are not clearly distinguished as within-effects from between effects. So rather than take the random-slopes resulting from a GLM model, we can recover the average within-effect and be provided with a significance test at the same time.
+
+
+
+#### Greenland Outlier
+
+```{r subswitch}
+# this particular sub-sample leads to a negative within-effect of fertility, when it is positive in the larger sample, here we check what 12 countries make such a large difference
+
+df_raw <- df_raw %>%
+  mutate(fertility_group = ifelse(iso3c == "GRL", 0, 1))
+
+ggplot(data = df_raw, aes(x = fertility_i, y = suicide_total_owd, color = factor(fertility_group))) +
+  geom_point(color = "white") +
+  geom_smooth(method = "lm") +
+  geom_text_repel(label = df_raw$iso3c, size = 2)
+```
+
+#### Centering, Data Setup
+
+These countries had a high number of imputations and should be dropped. When they are included the fertility effect mysteriously switches signs but remains significant. This could be an indicator of imputation effects. We drop them for now to be safe, but will explore this in the next iteration of the paper.
+
+"ASM" "BHR" "BMU" "BRN" "TCD" "CUB" "GNQ" "ERI" "GUM" "GNB" "LBY" "MHL" "PRK" "PSE" "SOM" "TKM" "ARE"
+
+
+
+```{r centering}
+# make list of countries to remove based on worrysome imputation
+remove <- c("ASM", "BHR", "BMU", "BRN", "TCD", "CUB", "GNQ", "ERI", "GUM", "GNB", "LBY", "MHL", "PRK", "PSE", "SOM", "TKM", "ARE")
+
+# fix GDP outliers
+df_raw_nomiss <- df_raw %>% 
+  mutate(gdp_madki_i = ifelse(gdp_madki_i > 80, 80, gdp_madki_i)) %>%
+  filter(!is.na(gdp_madki) & iso3c!= "GRL") # remove Greenland
+
+# centering divide variance into within and between countries
+df_raw_nomiss <- df_raw_nomiss %>%
+  group_by(iso3c) %>%
+  mutate(nonreligpct_i = nonreligpct_i*100,
+         alc_all_types_i_between = mean(alc_all_types_i, na.rm = T),
+         fertility_i_between = mean(fertility_i, na.rm = T),
+         gdp_madki_i_between = mean(gdp_madki_i, na.rm = T),
+         gini_disp_i_between = mean(gini_disp_i, na.rm = T),
+         crisis_idx_i_between = mean(crisis_idx_i, na.rm = T),
+         atwar_i_between = mean(atwar_i, na.rm = T),
+         regime_i_between = mean(regime_i, na.rm = T),
+         nonreligpct_i_between = mean(nonreligpct_i, na.rm = T),
+         alc_within = alc_all_types_i - alc_all_types_i_between,
+         fertility_within = fertility_i - fertility_i_between,
+         gdp_within = gdp_madki_i - gdp_madki_i_between,
+         gini_within = gini_disp_i - gini_disp_i_between,
+         crisis_within = crisis_idx_i - crisis_idx_i_between,
+         atwar_within = atwar_i - atwar_i_between,
+         regime_within = regime_i - regime_i_between,
+         nonrelig_within = nonreligpct_i - nonreligpct_i_between) %>%
+  ungroup() %>%
+  filter(!is.na(gini_disp_i) & !is.na(crisis_within)) %>%
+  filter(!is.na(regime_within) & !is.na(atwar_within))
+
+```
+
+#### Models
+
+```{r mlm}
+
+m11 <- lmer(suicide_total_owd ~ 
+              # between effects
+              alc_all_types_i_between + fertility_i_between + gdp_madki_i_between + 
+              # within effects
+              alc_within + fertility_within + gdp_within +
+              (1 | iso3c), data = df_raw_nomiss)
+
+# This code helped us to identify worrysome imputation cases
+# run on a sumbsample equal to m12
+#df_raw_nomiss_sub <- subset(df_raw_nomiss, !is.na(crisis_idx_i) & !is.na(gini_disp_i))
+
+# m11_sub <- lmer(suicide_total_owd ~ 
+#               # between effects
+#               alc_all_types_i_between + fertility_i_between + gdp_madki_i_between + 
+#               # within effects
+#               alc_within + fertility_within + gdp_within +
+#               (1 | iso3c), data = df_raw_nomiss_sub)
+
+m11f <- lmer(suicide_rate_female_owd ~ 
+              # between effects
+              alc_all_types_i_between + fertility_i_between + gdp_madki_i_between + 
+              # within effects
+              alc_within + fertility_within + gdp_within +
+              (1 | iso3c), data = df_raw_nomiss)
+
+m11m <- lmer(suicide_rate_male_owd ~ 
+              # between effects
+              alc_all_types_i_between + fertility_i_between + gdp_madki_i_between + 
+              # within effects
+              alc_within + fertility_within + gdp_within +
+              (1 | iso3c), data = df_raw_nomiss)
+
+# socio-economic shocks changes
+m12 <- lmer(suicide_total_owd ~ 
+              # between effects
+              alc_all_types_i_between + fertility_i_between + gdp_madki_i_between + 
+              # within effects
+              alc_within + fertility_within + gdp_within +  
+              # within effects only
+              gini_within + crisis_within +
+              (1 | iso3c), data = df_raw_nomiss)
+
+m12f <- lmer(suicide_rate_female_owd ~ 
+              # between effects
+              alc_all_types_i_between + fertility_i_between + gdp_madki_i_between + 
+              # within effects
+              alc_within + fertility_within + gdp_within +  
+              # within effects only
+              gini_within + crisis_within +
+              (1 | iso3c), data = df_raw_nomiss)
+
+m12m <- lmer(suicide_rate_male_owd ~ 
+              # between effects
+              alc_all_types_i_between + fertility_i_between + gdp_madki_i_between + 
+              # within effects
+              alc_within + fertility_within + gdp_within +  
+              # within effects only
+              gini_within + crisis_within +
+              (1 | iso3c), data = df_raw_nomiss)
+
+# war/politics
+m13 <- lmer(suicide_total_owd ~ 
+              # between effects
+              alc_all_types_i_between + fertility_i_between + gdp_madki_i_between + 
+              # within effects
+              alc_within + fertility_within + gdp_within +  
+              # within effects only
+              atwar_within + regime_within +
+              (1 | iso3c), data = df_raw_nomiss)
+
+m13f <- lmer(suicide_rate_female_owd ~ 
+              # between effects
+              alc_all_types_i_between + fertility_i_between + gdp_madki_i_between + 
+              # within effects
+              alc_within + fertility_within + gdp_within +  
+              # within effects only
+              atwar_within + regime_within +
+              (1 | iso3c), data = df_raw_nomiss)
+
+m13m <- lmer(suicide_rate_male_owd ~ 
+              # between effects
+              alc_all_types_i_between + fertility_i_between + gdp_madki_i_between + 
+              # within effects
+              alc_within + fertility_within + gdp_within +  
+              # within effects only
+              atwar_within + regime_within +
+              (1 | iso3c), data = df_raw_nomiss)
+
+# religion
+m14 <- lmer(suicide_total_owd ~ 
+              # between effects
+              alc_all_types_i_between + fertility_i_between + gdp_madki_i_between + nonreligpct_i_between + nonrelig_within +
+              # within effects
+              alc_within + fertility_within + gdp_within + 
+              (1 | iso3c), data = df_raw_nomiss)
+
+m14f <- lmer(suicide_rate_female_owd ~ 
+              # between effects
+              alc_all_types_i_between + fertility_i_between + gdp_madki_i_between + nonreligpct_i_between + nonrelig_within +
+              # within effects
+              alc_within + fertility_within + gdp_within + 
+              (1 | iso3c), data = df_raw_nomiss)
+
+m14m <- lmer(suicide_rate_male_owd ~ 
+              # between effects
+              alc_all_types_i_between + fertility_i_between + gdp_madki_i_between + nonreligpct_i_between + nonrelig_within +
+              # within effects
+              alc_within + fertility_within + gdp_within + 
+              (1 | iso3c), data = df_raw_nomiss)
+
+#summary(m11)
+```
+
+
+
+#### Coef Plot
+
+```{r within_cplot}
+fig31 <- plot_coefs(m11,m12,m13,m14,
+                   colors = "Qual1", 
+           coefs = c("Alcohol Consumption, Between-countries" = "alc_all_types_i_between", 
+                     "Fertility Rate, Between-countries" = "fertility_i_between", 
+                     "GDP per capita, Between-countries" = "gdp_madki_i_between", 
+                     "Not-Religious (%), Between-countries" = "nonreligpct_i_between", 
+                     "Alcohol Consumption, Within-countries" = "alc_within",
+                     "Fertility Rate, Within-countries" = "fertility_within",
+                     "GDP per capita, Within-countries" = "gdp_within",
+                     "Not-Religious (%), Within-countries" = "nonrelig_within",
+                     "Disposable Gini, Within-Countries" = "gini_within", 
+                     "Economic Crisis, Within-countries" = "crisis_within", 
+                     "At War, Within-countries" = "atwar_within", 
+                     "Democratization Scale, Within-countries" = "regime_within")) +
+  coord_cartesian(xlim = c(-10,20)) +
+  ggtitle("TOTAL") +
+  theme(legend.position = "none",
+        plot.title = element_text(color = "black"),
+        axis.text.y = element_text(color = "black", hjust = 0),
+        axis.title.x = element_text(color = "white"),
+        legend.text = element_text(color = "black", size = 13),
+        legend.title = element_blank()
+  )
+
+fig32 <- plot_coefs(m11m,m12m,m13m,m14m,
+                   colors = "Qual1", 
+           coefs = c("Alcohol Consumption, Between-countries" = "alc_all_types_i_between", 
+                     "Fertility Rate, Between-countries" = "fertility_i_between", 
+                     "GDP per capita, Between-countries" = "gdp_madki_i_between", 
+                     "Not-Religious (%), Between-countries" = "nonreligpct_i_between", 
+                     "Alcohol Consumption, Within-countries" = "alc_within",
+                     "Fertility Rate, Within-countries" = "fertility_within",
+                     "GDP per capita, Within-countries" = "gdp_within",
+                     "Not-Religious (%), Within-countries" = "nonrelig_within",
+                     "Disposable Gini, Within-Countries" = "gini_within", 
+                     "Economic Crisis, Within-countries" = "crisis_within", 
+                     "At War, Within-countries" = "atwar_within", 
+                     "Democratization Scale, Within-countries" = "regime_within")) +
+  coord_cartesian(xlim = c(-10,20)) +
+  ggtitle("MALES") +
+  theme(legend.position = "none",
+        plot.title = element_text(color = "black"),
+        axis.text.y = element_blank(),
+        axis.title.x = element_text(color = "white"),
+        legend.text = element_text(color = "black", size = 13),
+        legend.title = element_blank()
+  )
+
+fig33 <- plot_coefs(m11f,m12f,m13f,m14f,
+                   colors = "Qual1", 
+           coefs = c("Alcohol Consumption, Between-countries" = "alc_all_types_i_between", 
+                     "Fertility Rate, Between-countries" = "fertility_i_between", 
+                     "GDP per capita, Between-countries" = "gdp_madki_i_between", 
+                     "Not-Religious (%), Between-countries" = "nonreligpct_i_between", 
+                     "Alcohol Consumption, Within-countries" = "alc_within",
+                     "Fertility Rate, Within-countries" = "fertility_within",
+                     "GDP per capita, Within-countries" = "gdp_within",
+                     "Not-Religious (%), Within-countries" = "nonrelig_within",
+                     "Disposable Gini, Within-Countries" = "gini_within", 
+                     "Economic Crisis, Within-countries" = "crisis_within", 
+                     "At War, Within-countries" = "atwar_within", 
+                     "Democratization Scale, Within-countries" = "regime_within")) +
+  coord_cartesian(xlim = c(-10,20)) +
+  ggtitle("FEMALES") +
+  theme(legend.position = "none",
+        plot.title = element_text(color = "black"),
+        axis.text.y = element_blank(),
+        axis.title.x = element_text(color = "white"),
+        legend.text = element_text(color = "black", size = 13),
+        legend.title = element_blank()
+  )
+        
+        
+agg_png(filename = here::here("results/Fig4.png"), height = 900, width = 1400, res = 144)
+
+ggarrange(fig31, fig32, fig33, widths = c(4,2,2), nrow = 1, ncol = 3) 
+                                  
+
+
+dev.off()
+
+knitr::include_graphics(here::here("results/Fig4.png"))
+
+```
+
+
+#### Regression Tables
+
+##### Total
+
+```{r tabmodel}
+tab_model(m11,m12,m13,m14, digits = 3, p.style = "stars", show.ci = F, show.loglik = T, show.aic = T, file = here::here("results/TabA4.htm"))
+
+htmltools::includeHTML(here::here("results/TabA4.htm"))
+```
+
+The above results show that the 171 country sub-sample in m12 leads to a very different fertility effect (opposite sign and still significant) than the 183 country sample. We probe this further.
+
+
+##### Males
+
+```{r tabmodel2}
+tab_model(m11m,m12m,m13m,m14m, digits = 3, p.style = "stars", show.ci = F, show.loglik = T, show.aic = T, file = here::here("results/TabA5.htm"))
+
+htmltools::includeHTML(here::here("results/TabA5.htm"))
+```
+
+##### Females
+
+```{r tabmodel2}
+tab_model(m11f,m12f,m13f,m14f, digits = 3, p.style = "stars", show.ci = F, show.loglik = T, show.aic = T, file = here::here("results/TabA6.htm"))
+
+htmltools::includeHTML(here::here("results/TabA6.htm"))
+```
+
+
+#### Sub-Sample Problem
+
+```{r subsamp}
+df_raw_nomiss <- df_raw_nomiss %>%
+  mutate(subsample = ifelse(iso3c %in% df_raw_nomiss_sub$iso3c, 0, 1))
+
+ggplot(data = filter(df_raw_nomiss, subsample == 0), aes(x = fertility_within, y = suicide_total_owd)) +
+  geom_point() +
+  geom_smooth(method = "lm")
+#+
+  geom_text_repel(label = df_raw_nomiss$iso3c, size = 2)
+  
+```
+
+
+#### Within-country 'slopes'
+
+```{r slopes}
+# get slopes
+m11_slopes <- as.data.frame(round(ranef(m11)$iso3c,3))
+m12_slopes <- as.data.frame(round(ranef(m12)$iso3c,3))
+
+
+# extract grand mean
+m11_mean <- summary(m11)[["coefficients"]][2]
+m12_mean <- summary(m12)[["coefficients"]][2]
+
+
+# slopes must be added to grand mean slope!
+m11_slopes$gdp_madki <- m11_slopes$gdp_madki + m11_mean
+
+# slopes must be added to grand mean slope!
+m12_slopes$crisis_idx <- m12_slopes$crisis_idx + m12_mean
+```
+
+#### Plot GDP Slopes from M11
+
+```{r m11plot}
+# convert intercept to 0
+m11_slopes$`(Intercept)` <- 0
+
+ggplot(m11_slopes) +
+  geom_abline(aes(intercept = `(Intercept)`, slope = gdp_madki, group = rownames(m11_slopes))) +
+  geom_abline(xintercept = 0, slope = m11_mean, color = "purple", size = 1.5) + # add grand mean from m11
+  xlim(0, 2) +
+  ylim(0, 20) +
+  xlab("Within-Country Change in GDP Per Capita") +
+  ylab("Suicides Per Million Capita")
+```
+
+#### Plot Crisis Slopes from M12
+
+```{r m12plot}
+# convert intercept to 0
+m12_slopes$`(Intercept)` <- 0
+
+ggplot(m12_slopes) +
+  geom_abline(aes(intercept = `(Intercept)`, slope = crisis_idx, group = rownames(m12_slopes))) +
+  geom_abline(xintercept = 0, slope = m12_mean, color = "purple", size = 1.5) + # add grand mean from m12
+  xlim(0, 4) +
+  ylim(0, 20) +
+  xlab("Within-Country Change in Economic Crisis Index (0-4)") +
+  ylab("Suicides Per Million Capita")
+```

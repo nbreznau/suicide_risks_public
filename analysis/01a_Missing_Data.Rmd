@@ -1,0 +1,44 @@
+---
+title: "Missing data exploration - OWD suicide data"
+date: "2021-03-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.path = "results/missing-patterns-owd/",
+                      fig.width = 9,
+                      fig.height = 6,
+                      dpi = 120,
+                      fig.retina = 1,
+                      dev = "ragg_png")
+```
+
+```{r cntry, results='asis', message=FALSE}
+library(tidyverse)
+
+joined_raw_owd <- readRDS(here::here("output/joined_raw_owd.Rds"))
+
+countries <- joined_raw_owd$country %>% unique() %>% sort()
+
+vis_miss_cntry <- function(cntry) {
+  p <- joined_raw_owd %>% 
+    filter(country == cntry) %>% 
+    select(-c(starts_with("suicide"), country, iso3c, banking_crisis:inflation_crisis, average_household_size_number_of_members:`6_or_more_members`, alc_wine, alc_beer, alc_other_alcoholic_beverages, alc_spirits)) %>% 
+    mutate(across(-year, ~ is.na(.x))) %>% 
+    pivot_longer(-year, values_to = "missing") %>% 
+    ggplot(aes(year, name, fill = fct_rev(as.factor(missing)))) +
+    geom_raster() +
+    coord_cartesian(xlim = range(joined_raw_owd$year)) +
+    labs(x = NULL, y = NULL, fill = "Missing", subtitle = cntry) +
+    theme_minimal() +
+    theme(panel.ontop = TRUE)
+  
+  print(p)
+}
+
+walk(countries, function(x) {
+  cat("###", x, "\n\n")
+  vis_miss_cntry(x)
+  cat("\n\n")
+})
+```

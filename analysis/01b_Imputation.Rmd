@@ -1,0 +1,411 @@
+---
+title: "Tech 1. Imputation of values"
+author: "Nate Breznau, Christine Hedde - von Westernhagen"
+date: "`r format(Sys.Date(), '%d/%m/%y')`"
+output: 
+  html_document:
+    code_folding: show
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = F, 
+                      echo = T,
+                      fig.align = "center")
+
+#rm(list = ls()) # clean workspace
+pacman::p_load("tidyverse", "kableExtra", "imputeTS")
+
+```
+
+This dataframe was worked up by running the files in the */src* folder.
+
+```{r load}
+df_raw <- readRDS(here::here("output/joined_raw_owd.Rds"))
+
+df_raw <- df_raw %>% 
+  filter(!is.na(country)) %>%
+  filter(country != "Northern Mariana Islands")
+
+```
+
+After compiling data for our target variables many missing values remain. We use three types of information.
+
+1.  Within-country linear trends
+
+To use this we need a variable that has sporadic missing or not too many years of missing, ideally in-between values rather than at the tails of values. The variable must measure something stable and rather linear.
+
+**Female labor force participation**
+
+2.  Within and between-country linear trends
+
+We use both linear and global information for variables like **GDP** that are highly dependent on global economics.
+
+3.  (Stochastic) Full-Information Imputation
+
+Some values are missing for large segments of time (like a decade or more, or a large percentage of the total observation points in a country), or are not necessarily linear, like **marriage rates**.
+
+# Calculate Missing %
+
+```{r missing}
+# get ratio of missing to total values
+df_sum <- df_raw %>%
+  group_by(country) %>%
+  summarise(regime_m = sum(is.na(regime))/length(regime),
+            gini_m = sum(is.na(gini_disp))/length(gini_disp),
+            gdp_m = sum(is.na(gdp_cap))/length(gdp_cap),
+            gdp_mad_m = sum(is.na(gdp_madki))/length(gdp_madki),
+            alc_all_m = sum(is.na(alc_all_types))/length(alc_all_types),
+            unemp_nat_m = sum(is.na(unemp_nat))/length(unemp_nat),
+            unemp_ilo_m = sum(is.na(unemp_ilo))/length(unemp_ilo),
+            fertility_m = sum(is.na(fertility))/length(fertility),
+            fem_labour_m = sum(is.na(fem_labour))/length(fem_labour),
+            crisis_idx_m = sum(is.na(crisis_idx))/length(crisis_idx),
+            hh_1member_m = sum(is.na(`1_member`))/length(`1_member`),
+            christpct_m = sum(is.na(christpct_i))/length(christpct_i),
+            marit_rate_men_m = sum(is.na(marit_rate_men))/length(marit_rate_men),
+            marit_rate_women_m = sum(is.na(marit_rate_women))/length(marit_rate_women),
+            div_rate_female_m = sum(is.na(div_rate_female))/length(div_rate_female),
+            div_rate_male_m = sum(is.na(div_rate_male))/length(div_rate_male),
+            year_min = min(year),
+            year_max = max(year),
+            year_mean = mean(year),
+            cases = n()) %>% 
+  ungroup() %>%
+  rowwise() %>%
+  mutate(missing_avg = mean(c_across(-c(country, year_min, year_max, year_mean, cases)))) %>% 
+  select(country, missing_avg, everything()) %>% 
+  arrange(desc(missing_avg))
+
+# round
+#df_sum[,2:ncol(df_sum)] <- round(df_sum[,2:ncol(df_sum)],2)
+
+# table
+kable(df_sum, digits = 2) %>% 
+  kable_classic()
+
+```
+
+# Imputation
+
+## Impute GDP pre linear
+
+Step 1. World Bank interpolation
+
+Using a regression approach we can approximate GDP using both within country trends and global trends
+
+Use World Bank GDP to predict Maddison (plus interpolated). There are very few cases that this applies.
+
+Now GDP is ready for interpolation as above
+
+```{r gdp_imp}
+
+
+step1 <- lm(gdp_madki ~ gdp_cap + year + gdp_cap*year + iso3c, data = df_raw)
+
+df_raw2 <- df_raw %>%  
+  filter(iso3c != "PRK" & iso3c != "SOM" & iso3c != "SSD" & iso3c != "SYR" & iso3c != "TWN")
+
+df_raw2$gdp_madkiI <- predict(step1, newdata = df_raw2)
+
+# these countries have no data for gdp_cap
+df_raw3 <- df_raw %>%  
+  filter(iso3c == "PRK" | iso3c == "SOM" | iso3c == "SSD" | iso3c == "SYR" | iso3c == "TWN")
+
+
+df_raw2 <- df_raw2 %>%
+  mutate(gdp_madki_i = ifelse(is.na(gdp_madki), gdp_madkiI, gdp_madki))
+
+df_raw2 <- select(df_raw2, -c(gdp_madkiI))
+
+df_raw3$gdp_madki_i <- df_raw3$gdp_madki
+
+df_raw <- rbind(df_raw2, df_raw3)
+
+```
+
+## Within-Country Linear Trends
+
+ideally countries variables with 20% or less missing per country for gini, fem labor force participation, fertility, alcohol consumption.
+
+Regime can impute years when the government is 'missing' (war usually)
+
+```{r i_linear}
+# select cases
+flp15 <- df_sum$country[df_sum$fem_labour_m > 0 & df_sum$fem_labour_m<0.21]
+gini15 <- df_sum$country[df_sum$gini_m > 0 & df_sum$gini_m<0.21]
+fert15 <- df_sum$country[df_sum$fertility_m > 0 & df_sum$fertility_m<0.21]
+alc15 <- df_sum$country[df_sum$alc_all_m > 0 & df_sum$alc_all_m<0.21]
+regime15 <- df_sum$country[df_sum$regime_m > 0 & df_sum$regime_m<0.4] # regime is quite stable
+gdp15 <- df_sum$country[df_sum$gdp_cap_m > 0 & df_sum$gdp_cap_m<0.5] # we do this to account for the step 1 above (a larger margin allowed)
+
+
+# impute linearly for these cases
+# first make sure cases are ordered by year
+df_imp <- df_raw %>%
+  group_by(country) %>%
+  arrange(., year, .by_group = T) %>%
+          #We have a few cases from unemp_ilo that exist when unemp_nat is missing. 
+          #We can fill these in as our 'next best guess'.
+  mutate(unemp_i = ifelse(is.na(unemp_nat),unemp_ilo, unemp_nat),
+         unemp_i = ifelse(is.na(unemp_nat), NA, unemp_i),
+
+         fem_labour_i = ifelse(country %in% flp15,
+                               na_interpolation(fem_labour),
+                               fem_labour),
+
+         gini_disp_i = ifelse(country %in% gini15,
+                              na_interpolation(gini_disp),
+                              gini_disp),
+         
+         gini_mkt_i = ifelse(country %in% gini15,
+                              na_interpolation(gini_mkt),
+                              gini_mkt),
+
+         fertility_i = ifelse(country %in% fert15,
+                              na_interpolation(fertility),
+                              fertility),
+         
+         regime_i = ifelse(country %in% regime15,
+                              na_interpolation(regime),
+                              regime),
+         gdp_cap_i = ifelse(country %in% gdp15,
+                            na_interpolation(gdp_madki_i),
+                            gdp_madki_i),
+         
+         christpct_ii = ifelse(is.na(christpct_i), na_interpolation(christpct_i), christpct_i),
+         islampct_ii = ifelse(is.na(islampct_i), na_interpolation(islampct_i), islampct_i),
+         buddhapct_ii = ifelse(is.na(buddhapct_i), na_interpolation(buddhapct_i), buddhapct_i),
+         jewishpct_ii = ifelse(is.na(jewishpct_i), na_interpolation(jewishpct_i), jewishpct_i),
+         hindupct_ii = ifelse(is.na(hindupct_i), na_interpolation(hindupct_i), hindupct_i),
+         otherpct_ii = ifelse(is.na(otherpct_i), na_interpolation(otherpct_i), otherpct_i),
+         nonreligpct_ii = ifelse(is.na(nonreligpct_i), na_interpolation(nonreligpct_i), nonreligpct_i),
+         
+
+         alc_all_types_i = ifelse(country %in% alc15,
+                                  na_interpolation(alc_all_types),
+                                  alc_all_types)) %>% 
+
+  select(country, iso3c, year, unemp_nat, unemp_ilo, unemp_i, regime, regime_i, fem_labour, fem_labour_i, gini_disp, gini_disp_i, gini_mkt, gini_mkt_i, gdp_madki, gdp_madki_i, gdp_cap_i, fertility, fertility_i, alc_all_types, alc_all_types_i, christpct_i, christpct_ii, islampct_i, islampct_ii, buddhapct_i, buddhapct_ii, jewishpct_i, jewishpct_ii, hindupct_i, hindupct_ii, otherpct_i, otherpct_ii, nonreligpct_i, nonreligpct_ii, suicide_total_m, suicide_total_f, suicide_rate_female_owd, suicide_rate_male_owd, suicide_rate_total_owd, gdp_madki, pop, pop65, crisis_idx, marit_rate_men, marit_rate_women, div_rate_female, div_rate_male, atwar, socx) %>%
+  ungroup()
+
+
+```
+
+## Missing Data after safely interpolated trend values
+
+```{r missing_afterinterp}
+# get ratio of missing to total values
+df_sum2 <- df_imp %>%
+  group_by(country) %>%
+  summarise(regime_m = sum(is.na(regime_i))/length(regime_i),
+            gini_m = sum(is.na(gini_disp_i))/length(gini_disp_i),
+            gdp_cap_m = sum(is.na(gdp_cap_i))/length(gdp_cap_i),
+            alc_all_m = sum(is.na(alc_all_types_i))/length(alc_all_types_i),
+            unemp_m = sum(is.na(unemp_i))/length(unemp_i),
+            fertility_m = sum(is.na(fertility_i))/length(fertility_i),
+            fem_labour_m = sum(is.na(fem_labour_i))/length(fem_labour_i),
+            crisis_idx_m = sum(is.na(crisis_idx))/length(crisis_idx),
+            christpct_m = sum(is.na(christpct_ii))/length(christpct_ii),
+            marit_rate_men_m = sum(is.na(marit_rate_men))/length(marit_rate_men),
+            marit_rate_women_m = sum(is.na(marit_rate_women))/length(marit_rate_women),
+            div_rate_female_m = sum(is.na(div_rate_female))/length(div_rate_female),
+            div_rate_male_m = sum(is.na(div_rate_male))/length(div_rate_male),
+            year_min = min(year),
+            year_max = max(year),
+            year_mean = mean(year),
+            cases = n()) %>% 
+  ungroup() %>%
+  rowwise() %>%
+  mutate(missing_avg = mean(c_across(-c(country, year_min, year_max, year_mean, cases)))) %>% 
+  select(country, missing_avg, everything()) %>% 
+  arrange(desc(missing_avg))
+
+# table
+kable(df_sum2, digits = 2) %>% 
+  kable_classic()
+
+```
+
+## Interpolate Crisis Data
+
+Too many missing...
+
+American Samoa, Marshall Islands, Bermuda, Micronesia, Antigua & B, Kiribati, Grenada, US Virgin Isl
+
+Use US data
+
+Andorra
+
+Use France data
+
+Dominica
+
+Use Dominican Republic
+
+Seychelles
+
+Use Mauritius
+
+Sudan / South Sudan
+
+Use CAF (Central Afr Rep)
+
+```{r crisis_interp}
+
+df_imp$crisis_idx_i <- df_imp$crisis_idx
+
+df_imp$crisis_idx_i[df_imp$iso3c == "ASM"] <- df_imp$crisis_idx_i[df_imp$iso3c == "USA"]
+
+df_imp$crisis_idx_i[df_imp$iso3c == "MHL"] <- df_imp$crisis_idx_i[df_imp$iso3c == "USA"]
+
+df_imp$crisis_idx_i[df_imp$iso3c == "BMU"] <- df_imp$crisis_idx_i[df_imp$iso3c == "USA"]
+
+df_imp$crisis_idx_i[df_imp$iso3c == "FSM"] <- df_imp$crisis_idx_i[df_imp$iso3c == "USA"]
+
+df_imp$crisis_idx_i[df_imp$iso3c == "ATG"] <- df_imp$crisis_idx_i[df_imp$iso3c == "USA"]
+
+df_imp$crisis_idx_i[df_imp$iso3c == "KIR"] <- df_imp$crisis_idx_i[df_imp$iso3c == "USA"]
+
+df_imp$crisis_idx_i[df_imp$iso3c == "GRD"] <- df_imp$crisis_idx_i[df_imp$iso3c == "USA"]
+
+df_imp$crisis_idx_i[df_imp$iso3c == "VIR"] <- df_imp$crisis_idx_i[df_imp$iso3c == "USA"]
+
+df_imp$crisis_idx_i[df_imp$iso3c == "AND"] <- df_imp$crisis_idx_i[df_imp$iso3c == "FRA"]
+
+df_imp$crisis_idx_i[df_imp$iso3c == "DMA"] <- df_imp$crisis_idx_i[df_imp$iso3c == "DOM"]
+
+df_imp$crisis_idx_i[df_imp$iso3c == "SYC"] <- df_imp$crisis_idx_i[df_imp$iso3c == "MRT"]
+
+df_imp$crisis_idx_i[df_imp$iso3c == "SSD"] <- df_imp$crisis_idx_i[df_imp$iso3c == "CAF"]
+
+df_imp$crisis_idx_i[df_imp$iso3c == "SDN"] <- df_imp$crisis_idx_i[df_imp$iso3c == "CAF"]
+
+
+```
+
+Make at war countries simply 0 in case of NA
+
+```{r war}
+df_imp <- df_imp %>%
+  mutate(atwar_i = ifelse(is.na(atwar), 0, atwar))
+```
+
+Try logistic approach using GDP and unemp
+
+```{r log_crisis}
+crisis1 <- lm(crisis_idx_i ~ gdp_madki_i + unemp_i + atwar + year, data = df_imp)
+
+df_imp$crisis_idx_iI <- round(predict(crisis1, newdata = df_imp),0)
+
+df_imp <- df_imp %>%
+  mutate(crisis_idx_i = ifelse(is.na(crisis_idx_i), crisis_idx_iI, crisis_idx_i),
+         crisis_idx_i = ifelse(crisis_idx_i < 0, 0, ifelse(crisis_idx_i > 1, 1, crisis_idx_i)))
+
+# for countries that have some non-missing crisis data, we replace the remainder with 0's for purposes of regression. We rather guess 0 than not for conservative estimates
+
+df_imp <- df_imp %>%
+  group_by(iso3c) %>%
+  mutate(crisis_idx_i = ifelse(is.na(crisis_idx_i) & !is.na(mean(crisis_idx_i, na.rm = T)), 0, crisis_idx_i))
+
+
+# export imputed data
+saveRDS(df_imp, here::here("data/df_imp_raw.Rds"))
+```
+
+# Old Code, maybe don't need it anymore?
+
+-   Plots variable values over time for each country and highlights imputed values, so depends. Useful for exploration of imputed data.
+
+```{r, i_linear_plots, fig.width=10, fig.height=3, message=FALSE, results='asis', warning=FALSE, eval=FALSE}
+
+df_imp <- df_imp %>%
+  pivot_longer(cols = c(4:44), names_to = "imp_var") %>% #adapt for more vars
+  mutate(imputed = ifelse(str_detect(imp_var, "_i$"), TRUE, FALSE),
+         imp_var = str_remove(imp_var, "_i$"))
+
+impute_plotter <- function(cntry){
+  p <- df_imp %>%
+    filter(country == cntry) %>%
+    ggplot() +
+    geom_line(aes(year, value, color = fct_rev(as.factor(imputed)))) +
+    facet_wrap(~ imp_var, scales = "free_y", nrow = 1) +
+    labs(color = "Imputed values") +
+    theme_minimal() +
+    theme(legend.position = "top")
+
+  print(p)
+}
+
+countries <- df_raw$country %>% unique() %>% sort()
+
+walk(countries, function(x) {
+  cat("#####", x, "\n\n")
+  impute_plotter(x)
+  cat("\n\n")
+})
+
+```
+
+# Between and Within Trends
+
+We have complete GDP information whenever a country is present in the Maddison data, therefore we should just use these data.
+
+# Imputation Full-Information
+
+Here we use information from the dependent variable as well as all independent variables to impute values. We should also do this for gini using the standard error. The process generates many datasets with plausible imputed values, then we run our models on these many datasets in order to arrive at a solution. The alternative is using FIML estimation using maximum likelihood. The results should be pretty similar.
+
+## Variable exploration
+
+### Correlations
+
+```{r corr, fig.width=8, fig.height=8}
+
+# read in again to be sure it's the original (unedited) data frame
+df_raw <- readRDS(here::here("output/joined_raw_owd.Rds"))
+
+corr <- df_raw %>% 
+  select(-c(starts_with("suicide"), country, iso3c, banking_crisis:inflation_crisis,
+            average_household_size_number_of_members:`6_or_more_members`, 
+            alc_wine, alc_beer, alc_other_alcoholic_beverages, alc_spirits)) %>% 
+  cor(use = "pairwise.complete.obs")
+
+
+corr %>% corrplot::corrplot(diag = FALSE, method = "number", type = "lower",
+                            addCoefasPercent = TRUE, tl.col = "black", number.cex = .7)
+
+```
+
+#### Based on correlations \>.5, following imputations might be adequate:
+
+```{r corr_05}
+
+# variables to impute
+to_impute <- c("fertility", "marit_rate_men", "marit_rate_women", "div_rate_male", "div_rate_female")
+
+corr_list <- 
+  # enter to be imputed values here
+  map(to_impute,
+      # put variables and values with corr. >.5 into tibbles
+      ~ corr[.x,] %>% 
+        subset(abs(.)>=.5) %>% 
+        round(2) %>% 
+        paste(names(.), .) %>% 
+        tibble()) %>% 
+  # set names of tibbles
+  imap(~setNames(.x, to_impute[.y])) %>%
+  # create rowname variable for joining
+  map(rownames_to_column) %>%
+  # reduce list to one data frame by joining all tibbles
+  reduce(full_join, by = "rowname") %>% 
+  select(-rowname) %>% 
+  # replace NA with empty strings
+  mutate(across(everything(), ~replace_na(., "")))
+
+corr_list %>% 
+  kable() %>% 
+  kable_classic()
+
+```
+
+
