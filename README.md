@@ -1,5 +1,4 @@
-# Risk Factors of Suicide at the Societal Level: A Global Cross-country
-Study
+# Risk Factors of Suicide at the Societal Level: A Global Cross-country Study
 ================
 
 -   [Working Paper](https://docs.google.com/document/d/1pqrhyJhLlgvDlG8XqJwYnN_kGjQ7g7Gso5VAV6bhdWk/edit?usp=sharing) - not finished (feel free to comment!)
